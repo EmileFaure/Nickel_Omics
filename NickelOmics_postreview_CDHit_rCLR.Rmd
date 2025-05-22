@@ -1,0 +1,623 @@
+---
+title: "NickelOmics rCLR version"
+date: "2025-04-18"
+author: "Emile Faure"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: united
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+require(tidyverse)
+require(reshape2)
+require(RColorBrewer)
+require(ComplexHeatmap)
+require(dendextend)
+require(circlize)
+require(viridis)
+require(naniar)
+require(pals)
+require(PermCor)
+require(vegan)
+library(gridExtra)
+library(data.table)
+
+lmp <- function (modelobject) {
+  if (class(modelobject) != "lm") stop("Not an object of class 'lm' ")
+  f <- summary(modelobject)$fstatistic
+  p <- pf(f[1],f[2],f[3],lower.tail=F)
+  attributes(p) <- NULL
+  return(p)
+}
+
+source("/Users/emifaure/Documents/TONGA/StageMilo/PetB_Corr_Heatmaps_RDA/scoresRDA.R")
+
+```
+
+# Load metadata
+```{r load metadata}
+########## Load metadata ############
+
+meta <- read.table(file = "/Users/emifaure/Documents/ACE/MetaData/ACE_metadata/Metadata_For_Submission/meta_CTD_ForSubmission.csv", 
+                   header=TRUE, sep = ";", dec = ".", stringsAsFactors = FALSE)
+meta <- meta %>% 
+  mutate_if(.predicate = is.character, .funs = as.factor)
+
+# Load list of metagenomes
+metagenomes <- read.table("/Users/emifaure/Documents/ACE/Metagenomics/ACEsamples_With_Ace_seq_name.tsv", header = TRUE)
+
+# Load Nickel dataset
+Nickel=read.table("/Users/emifaure/Documents/ACE/NolwennCollab/NickelData.txt", sep="\t", header=T, dec=",")
+meta_nickel = meta %>% inner_join(Nickel, by=c("TM_station_number","Depth_m")) %>%
+  filter(!is.na(Ni_60_58_D_DELTA_BOTTLE))
+# 85 ACE_seq_Name have a nickel values, how many in out sequenced metagenomes ?
+
+meta_nickel = meta_nickel[which(meta_nickel$ACE_seq_name %in% metagenomes$ace_seq_name),]
+# we have 48 metagenomes that can be associated with an isotopic value
+
+
+```
+
+# Load metagenomics data
+```{r load metag and annot}
+########## Load Metagnomics data ############
+
+# CDHit clusters of interest were selected according to their functional annotations:
+#  - Annotations containing one of the words "urease", "NiFe", ["superoxide"+"dismutase"] in eggNOG annotation file
+#  - Annotations as KEGG ID corresponding to an urease, NiFe hydrgenase or superoxide dismutase
+
+# Here we load rCLR transformed data (log(abundance / geometric mean of abundances of all genes in the sample), perfect to deal with compositionnality issues but quite senseless to sum the obtained values... Better to mean them if needed):
+GeneMat = read.table("/Users/emifaure/Documents/ACE/NolwennCollab/Post_Review/GM_CDHit_rCLR-trans_MetalloEnzymes.tsv", sep="\t", header=T)
+
+# The sample names are not in ACE_Seq format, we make the conversion :
+for (i in 2:ncol(GeneMat)){
+  names(GeneMat)[i] <- sub("_SORTED", "", names(GeneMat)[i])
+  names(GeneMat)[i] <- metagenomes$ace_seq_name[which(metagenomes$sample==names(GeneMat)[i])]
+}
+row.names(GeneMat)=GeneMat$CDHit_ID
+GeneMat_Nickel = GeneMat[,names(GeneMat) %in% meta_nickel$ACE_seq_name]
+GeneMat_Nickel=as.data.frame(t(GeneMat_Nickel))
+
+# Results from the ACE metagenomics catalog showed that abundance patterns can be extremely different across size fractions for one AGC, and it should make more sense to divide between A (>3 micrometers, attached and eukaryotes) and B+C (0.2-3 and 0.2-40 micrometers, which are dominated by prokaryotes).
+meta_nickel_FL = meta_nickel[-which(meta_nickel$Size_fraction==">3 µm"),]
+meta_nickel_ATT = meta_nickel[which(meta_nickel$Size_fraction==">3 µm"),]
+GeneMat_Nickel_FL = GeneMat_Nickel[row.names(GeneMat_Nickel) %in% meta_nickel_FL$ACE_seq_name,]
+GeneMat_Nickel_FL=GeneMat_Nickel_FL[match(meta_nickel_FL$ACE_seq_name,row.names(GeneMat_Nickel_FL)),]
+#Remove columns of only 0
+GeneMat_Nickel_FL = GeneMat_Nickel_FL[,-which(colSums(GeneMat_Nickel_FL)==0)]
+GeneMat_Nickel_ATT = GeneMat_Nickel[row.names(GeneMat_Nickel) %in% meta_nickel_ATT$ACE_seq_name,]
+GeneMat_Nickel_ATT=GeneMat_Nickel_ATT[match(meta_nickel_ATT$ACE_seq_name,row.names(GeneMat_Nickel_ATT)),]
+#Remove columns of only 0
+GeneMat_Nickel_ATT = GeneMat_Nickel_ATT[,-which(colSums(GeneMat_Nickel_ATT)==0)]
+
+# Load functional annotations for the CD-Hit clusters
+AnnotFull=read.table("/Users/emifaure/Documents/ACE/NolwennCollab/Annotations_CDHit_Metallo.tsv", sep="\t", header=F,fill=T, quote = '', na.strings =c('','-'))
+names(AnnotFull)=c("Gene_ID","AGC_ID","AGC_Rep","AGC_Size","AGC_Cat","Singl_Cat","CDHit_Rep","Domain","KEGG","seed_ortholog","eggNOG_OGs","narr_OG_name","narr_OG_cat","narr_OG_desc","best_OG_name","best_OG_cat","best_OG_desc","Preferred_name","CAZy","BiGG_Reaction","PFAMs")
+
+```
+
+# Broad Functional level investigations
+```{r Function}
+# First we will agreggate the CD-Hit clusters by broad functional type
+Func_simplify <- rep("Unclassified",nrow(AnnotFull))
+Func_simplify[grepl("urease", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("ure", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("Ure", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("K03190", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("K03189", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("K03188", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("NiFe", do.call(paste0, AnnotFull), ignore.case=TRUE)]="NiFe Hydrogenase"
+Func_simplify[grepl("hydrogenase", do.call(paste0, AnnotFull), ignore.case=TRUE)]="NiFe Hydrogenase"
+Func_simplify[grepl("superoxide", do.call(paste0, AnnotFull), ignore.case=TRUE)]="SOD"
+Func_simplify[grepl("sod", do.call(paste0, AnnotFull), ignore.case=TRUE)]="SOD"
+Func_simplify[grepl("Sod_", do.call(paste0, AnnotFull), ignore.case=TRUE)]="SOD"
+Func_simplify[grepl("K04565", do.call(paste0, AnnotFull), ignore.case=TRUE)]="SOD"
+
+AnnotFull$FuncSimplify <- Func_simplify
+
+Enzyme_IDs=unique(AnnotFull$FuncSimplify)[!is.na(unique(AnnotFull$FuncSimplify))]
+
+#Initiate matrix for FL:
+Enzyme_matrix_FL=GeneMat_Nickel_FL[,1:length(Enzyme_IDs)]
+#Fill matrix
+for (i in c(1:length(Enzyme_IDs))) {
+  Enzyme_matrix_FL[,i]=rowMeans(GeneMat_Nickel_FL[,which(names(GeneMat_Nickel_FL) %in% AnnotFull[which(AnnotFull$FuncSimplify==Enzyme_IDs[i]),"Gene_ID"]),drop=F])
+  names(Enzyme_matrix_FL)[i]=Enzyme_IDs[i]
+}
+
+#Initiate matrix for ATT:
+Enzyme_matrix_ATT=GeneMat_Nickel_ATT[,1:length(Enzyme_IDs)]
+#Fill matrix
+for (i in c(1:length(Enzyme_IDs))) {
+  Enzyme_matrix_ATT[,i]=rowMeans(GeneMat_Nickel_ATT[,which(names(GeneMat_Nickel_ATT) %in% AnnotFull[which(AnnotFull$FuncSimplify==Enzyme_IDs[i]),"Gene_ID"]),drop=F])
+  names(Enzyme_matrix_ATT)[i]=Enzyme_IDs[i]
+}
+
+# Add the nickel data and metadata
+EnzymeFL_Ni = merge(Enzyme_matrix_FL,meta_nickel_FL,by.x="row.names",by.y="ACE_seq_name")
+EnzymeATT_Ni = merge(Enzyme_matrix_ATT,meta_nickel_ATT,by.x="row.names",by.y="ACE_seq_name")
+
+# Plots
+
+# FL SF :
+EnzymeFL_Ni_plot <- EnzymeFL_Ni %>% select(Row.names, SOD,Urease,`NiFe Hydrogenase`,Ni_60_58_D_DELTA_BOTTLE,MertzGlacier) %>%
+  pivot_longer(-c(Ni_60_58_D_DELTA_BOTTLE,MertzGlacier, Row.names),names_to = "Enzyme",values_to = "Abundance") %>%
+  mutate(Enzyme = fct_relevel(Enzyme, 
+                              "NiFe Hydrogenase", "SOD", "Urease"))
+
+ggplot(EnzymeFL_Ni_plot) + 
+  geom_smooth(aes(x=Ni_60_58_D_DELTA_BOTTLE,y=Abundance,col=Enzyme),method="lm",alpha=0.2) +
+  geom_point(aes(x=Ni_60_58_D_DELTA_BOTTLE,y=Abundance,col=Enzyme,shape=MertzGlacier),size=3) +
+  scale_color_brewer(palette = "Dark2") +
+  theme_bw() +
+  labs(y="Mean rCLR-transformed coverage", x=expression(delta^60 * Ni ~ "(‰)"), shape="Mertz Glacier") +
+  theme(text = element_text(size = 16)) +
+  facet_wrap(~Enzyme,scales = "free",nrow = 1)
+
+testFL <- data.frame(Enzyme=c("SOD","Urease","NiFe Hydrogenase"),pval=rep(0,3), coef=rep(0,3), R2=rep(0,3))
+for(i in c(1:3)) {
+  testFL$pval[i] <- perm_test(EnzymeFL_Ni[,testFL$Enzyme[i]],EnzymeFL_Ni$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided", B=1000)$p.value
+  res=lm(EnzymeFL_Ni[,testFL$Enzyme[i]]~EnzymeFL_Ni$Ni_60_58_D_DELTA_BOTTLE)
+  testFL$R2[i]=summary(res)$adj.r.squared
+  testFL$coef[i]=res$coefficients[2]
+}
+testFL$pvalspear.adj=p.adjust(testFL$pval, method="BH")
+testFL
+
+# Try without Mertz :
+EnzymeFL_Ni_nomertz <- EnzymeFL_Ni[-which(EnzymeFL_Ni$MertzGlacier==TRUE),]
+testFL <- data.frame(Enzyme=c("SOD","Urease","NiFe Hydrogenase"),pval=rep(0,3))
+for(i in c(1:3)) {
+  testFL$pval[i] <- perm_test(EnzymeFL_Ni_nomertz[,testFL$Enzyme[i]],EnzymeFL_Ni_nomertz$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided", B=1000)$p.value
+}
+testFL$pvalspear.adj=p.adjust(testFL$pval, method="BH")
+testFL
+
+# ATT SF :
+EnzymeATT_Ni_plot <- EnzymeATT_Ni %>% select(SOD,Urease,`NiFe Hydrogenase`,Ni_60_58_D_DELTA_BOTTLE,MertzGlacier) %>%
+  pivot_longer(-c(Ni_60_58_D_DELTA_BOTTLE,MertzGlacier),names_to = "Enzyme",values_to = "Abundance") %>%
+  mutate(Enzyme = fct_relevel(Enzyme, 
+                              "NiFe Hydrogenase", "SOD", "Urease"))
+
+
+ggplot(EnzymeATT_Ni_plot) + 
+  geom_smooth(aes(x=Ni_60_58_D_DELTA_BOTTLE,y=Abundance,col=Enzyme),method="lm",alpha=0.2) +
+  geom_point(aes(x=Ni_60_58_D_DELTA_BOTTLE,y=Abundance,col=Enzyme,shape=MertzGlacier),size=3) +
+  scale_color_brewer(palette = "Dark2") +
+  theme_bw() +
+  labs(y="Mean rCLR-transformed coverage", x=expression(delta^60 * Ni ~ "(‰)"), shape="Mertz Glacier") +
+  theme(text = element_text(size = 16)) +
+  facet_wrap(~Enzyme,scales = "free",nrow=1)
+
+testATT <- data.frame(Enzyme=c("SOD","Urease","NiFe Hydrogenase"),pval=rep(0,3), coef=rep(0,3), R2=rep(0,3))
+for(i in c(1:3)) {
+  testATT$pval[i] <- perm_test(EnzymeATT_Ni[,testATT$Enzyme[i]],EnzymeATT_Ni$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided", B=1000)$p.value
+  res=lm(EnzymeATT_Ni[,testATT$Enzyme[i]]~EnzymeATT_Ni$Ni_60_58_D_DELTA_BOTTLE)
+  testATT$R2[i]=summary(res)$adj.r.squared
+  testATT$coef[i]=res$coefficients[2]
+}
+testATT$pvalspear.adj=p.adjust(testATT$pval, method="BH")
+testATT
+```
+
+# KEGG Functional level investigations
+```{r KEGG}
+KEGG_IDs=unique(AnnotFull$KEGG)[!is.na(unique(AnnotFull$KEGG))]
+
+#Initiate matrix :
+KEGG_matrix_FL=GeneMat_Nickel_FL[,1:length(KEGG_IDs)]
+#Fill matrix
+for (i in c(1:length(KEGG_IDs))) {
+  KEGG_matrix_FL[,i]=rowMeans(GeneMat_Nickel_FL[,which(names(GeneMat_Nickel_FL) %in% AnnotFull[which(AnnotFull$KEGG==KEGG_IDs[i]),"Gene_ID"]),drop=F], na.rm = T)
+  KEGG_matrix_FL[,i][is.na(KEGG_matrix_FL[,i])] = 0
+  names(KEGG_matrix_FL)[i]=KEGG_IDs[i]
+}
+KEGG_matrix_FL=KEGG_matrix_FL[,-which(colSums(KEGG_matrix_FL)==0)]
+
+#Initiate matrix :
+KEGG_matrix_ATT=GeneMat_Nickel_ATT[,1:length(KEGG_IDs)]
+#Fill matrix
+for (i in c(1:length(KEGG_IDs))) {
+  KEGG_matrix_ATT[,i]=rowSums(GeneMat_Nickel_ATT[,which(names(GeneMat_Nickel_ATT) %in% AnnotFull[which(AnnotFull$KEGG==KEGG_IDs[i]),"Gene_ID"]), drop=F])
+  names(KEGG_matrix_ATT)[i]=KEGG_IDs[i]
+}
+KEGG_matrix_ATT=KEGG_matrix_ATT[,-which(colSums(KEGG_matrix_ATT)==0)]
+
+# FL size fraction
+
+Results_lm_FL=data.frame(KEGG_ID=c("KEGGID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+KEGG_matrix_FL=KEGG_matrix_FL[match(meta_nickel_FL$ACE_seq_name,row.names(KEGG_matrix_FL)),]
+
+for (i in c(1:ncol(KEGG_matrix_FL))) {
+  res=lm(KEGG_matrix_FL[,i]~meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(KEGG_matrix_FL)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(KEGG_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(KEGG_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_FL[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_FL$KEGG_ID=as.factor(Results_lm_FL$KEGG_ID)
+Results_lm_FL$R2adj=as.numeric(Results_lm_FL$R2adj)
+Results_lm_FL$Coef=as.numeric(Results_lm_FL$Coef)
+Results_lm_FL$pvallm=as.numeric(Results_lm_FL$pvallm)
+Results_lm_FL$pvallm.adj=p.adjust(Results_lm_FL$pvallm, method="BH")
+Results_lm_FL$corspear=as.numeric(Results_lm_FL$corspear)
+Results_lm_FL$pvalspear=as.numeric(Results_lm_FL$pvalspear)
+Results_lm_FL$pvalspear.adj=p.adjust(Results_lm_FL$pvalspear, method="BH")
+summary(Results_lm_FL)
+# Nothing worth going further
+
+# ATT size fraction
+
+Results_lm_ATT=data.frame(KEGG_ID=c("KEGGID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0),
+                          corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+KEGG_matrix_ATT=KEGG_matrix_ATT[match(meta_nickel_ATT$ACE_seq_name,row.names(KEGG_matrix_ATT)),]
+
+for (i in c(1:ncol(KEGG_matrix_ATT))) {
+  res=lm(KEGG_matrix_ATT[,i]~meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(KEGG_matrix_ATT)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(KEGG_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(KEGG_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_ATT[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_ATT$KEGG_ID=as.factor(Results_lm_ATT$KEGG_ID)
+Results_lm_ATT$R2adj=as.numeric(Results_lm_ATT$R2adj)
+Results_lm_ATT$Coef=as.numeric(Results_lm_ATT$Coef)
+Results_lm_ATT$pvallm=as.numeric(Results_lm_ATT$pvallm)
+Results_lm_ATT$pvallm.adj=p.adjust(Results_lm_ATT$pvallm, method="BH")
+Results_lm_ATT$corspear=as.numeric(Results_lm_ATT$corspear)
+Results_lm_ATT$pvalspear=as.numeric(Results_lm_ATT$pvalspear)
+Results_lm_ATT$pvalspear.adj=p.adjust(Results_lm_ATT$pvalspear, method="BH")
+summary(Results_lm_ATT)
+
+Results_lm_ATT[Results_lm_ATT$pvalspear.adj<0.05,] # This KO is absent everywhere but one sample
+# Nothing worth going further
+```
+
+# EggNOG Functional level investigations
+```{r EggNOG}
+EggNOG_IDs=unique(AnnotFull$best_OG_desc)[!is.na(unique(AnnotFull$best_OG_desc))]
+
+#Initiate matrix :
+EggNOG_matrix_FL=GeneMat_Nickel_FL[,1:length(EggNOG_IDs)]
+#Fill matrix
+for (i in c(1:length(EggNOG_IDs))) {
+  EggNOG_matrix_FL[,i]=rowMeans(GeneMat_Nickel_FL[,which(names(GeneMat_Nickel_FL) %in% AnnotFull[which(AnnotFull$best_OG_desc==EggNOG_IDs[i]),"Gene_ID"]),drop=F], na.rm=TRUE)
+  EggNOG_matrix_FL[,i][is.na(EggNOG_matrix_FL[,i])] = 0
+  names(EggNOG_matrix_FL)[i]=EggNOG_IDs[i]
+}
+EggNOG_matrix_FL=EggNOG_matrix_FL[,-which(colSums(EggNOG_matrix_FL)==0)]
+
+#Initiate matrix :
+EggNOG_matrix_ATT=GeneMat_Nickel_ATT[,1:length(EggNOG_IDs)]
+#Fill matrix
+for (i in c(1:length(EggNOG_IDs))) {
+  EggNOG_matrix_ATT[,i]=rowMeans(GeneMat_Nickel_ATT[,which(names(GeneMat_Nickel_ATT) %in% AnnotFull[which(AnnotFull$best_OG_desc==EggNOG_IDs[i]),"Gene_ID"]), drop=F])
+  EggNOG_matrix_ATT[,i][is.na(EggNOG_matrix_ATT[,i])] = 0
+  names(EggNOG_matrix_ATT)[i]=EggNOG_IDs[i]
+}
+EggNOG_matrix_ATT=EggNOG_matrix_ATT[,-which(colSums(EggNOG_matrix_ATT)==0)]
+
+# FL size fraction
+
+Results_lm_FL=data.frame(EggNOG_ID=c("EggNOGID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+EggNOG_matrix_FL=EggNOG_matrix_FL[match(meta_nickel_FL$ACE_seq_name,row.names(EggNOG_matrix_FL)),]
+
+for (i in c(1:ncol(EggNOG_matrix_FL))) {
+  res=lm(EggNOG_matrix_FL[,i]~meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(EggNOG_matrix_FL)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(EggNOG_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(EggNOG_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_FL[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_FL$EggNOG_ID=as.factor(Results_lm_FL$EggNOG_ID)
+Results_lm_FL$R2adj=as.numeric(Results_lm_FL$R2adj)
+Results_lm_FL$Coef=as.numeric(Results_lm_FL$Coef)
+Results_lm_FL$pvallm=as.numeric(Results_lm_FL$pvallm)
+Results_lm_FL$pvallm.adj=p.adjust(Results_lm_FL$pvallm, method="BH")
+Results_lm_FL$corspear=as.numeric(Results_lm_FL$corspear)
+Results_lm_FL$pvalspear=as.numeric(Results_lm_FL$pvalspear)
+Results_lm_FL$pvalspear.adj=p.adjust(Results_lm_FL$pvalspear, method="BH")
+summary(Results_lm_FL)
+# Some spearman might be worth investigating
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05),] %>% arrange(desc(corspear)) #14 significant according to spearman pre-correction, highest coeff = SOD
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05 & Results_lm_FL$corspear>0),] %>% arrange(desc(corspear)) # Only 4 have coeff >0 and none passes the adjustment
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL[,"COG2370 Hydrogenase urease accessory protein"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_FL[,"COG2370 Hydrogenase urease accessory protein"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_FL$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="COG2370 Hydrogenase urease accessory protein", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL[,"Superoxide dismutase"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_FL[,"Superoxide dismutase"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_FL$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="Superoxide dismutase", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+# Again, mertz seems to disturb the relationship. Let's try without it :
+Results_lm_FL=data.frame(EggNOG_ID=c("EggNOGID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+meta_nickel_FL_nomertz<-meta_nickel_FL[-which(meta_nickel_FL$MertzGlacier==TRUE),]
+EggNOG_matrix_FL_nomertz=EggNOG_matrix_FL[match(meta_nickel_FL_nomertz$ACE_seq_name,row.names(EggNOG_matrix_FL)),]
+
+for (i in c(1:ncol(EggNOG_matrix_FL_nomertz))) {
+  res=lm(EggNOG_matrix_FL_nomertz[,i]~meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(EggNOG_matrix_FL_nomertz)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(EggNOG_matrix_FL_nomertz[,i],meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(EggNOG_matrix_FL_nomertz[,i],meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_FL[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_FL$EggNOG_ID=as.factor(Results_lm_FL$EggNOG_ID)
+Results_lm_FL$R2adj=as.numeric(Results_lm_FL$R2adj)
+Results_lm_FL$Coef=as.numeric(Results_lm_FL$Coef)
+Results_lm_FL$pvallm=as.numeric(Results_lm_FL$pvallm)
+Results_lm_FL$pvallm.adj=p.adjust(Results_lm_FL$pvallm, method="BH")
+Results_lm_FL$corspear=as.numeric(Results_lm_FL$corspear)
+Results_lm_FL$pvalspear=as.numeric(Results_lm_FL$pvalspear)
+Results_lm_FL$pvalspear.adj=p.adjust(Results_lm_FL$pvalspear, method="BH")
+summary(Results_lm_FL)
+# Some spearman might be worth investigating
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05),] %>% arrange(desc(corspear)) #16 significant according to spearman pre-correction, highest coeff = SOD
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05 & Results_lm_FL$corspear>0),] %>% arrange(desc(corspear)) # 6 have coeff >0 and 3 passes the adjustment
+#Superoxide dismutase
+#uracil-DNA glycosylase (narrow og desc = UreE urease accessory protein)
+#COG2370 Hydrogenase urease accessory protein
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL_nomertz[,"Superoxide dismutase"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_FL_nomertz[,"Superoxide dismutase"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE), size=3) +
+  theme_bw() +
+  labs(y="Superoxide dismutase (EggNOG best OG, % of coverage)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL_nomertz[,"COG2370 Hydrogenase urease accessory protein"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_FL_nomertz[,"COG2370 Hydrogenase urease accessory protein"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE), size=3) +
+  theme_bw() +
+  labs(y="COG2370 Hydrogenase urease accessory protein (EggNOG best OG description)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL_nomertz[,"uracil-DNA glycosylase"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_FL_nomertz[,"uracil-DNA glycosylase"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_FL_nomertz$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="uracil-DNA glycosylase (EggNOG best OG description)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+# ATT size fraction
+
+Results_lm_ATT=data.frame(EggNOG_ID=c("EggNOGID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+EggNOG_matrix_ATT=EggNOG_matrix_ATT[match(meta_nickel_ATT$ACE_seq_name,row.names(EggNOG_matrix_ATT)),]
+
+for (i in c(1:ncol(EggNOG_matrix_ATT))) {
+  res=lm(EggNOG_matrix_ATT[,i]~meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(EggNOG_matrix_ATT)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(EggNOG_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(EggNOG_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_ATT[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_ATT$EggNOG_ID=as.factor(Results_lm_ATT$EggNOG_ID)
+Results_lm_ATT$R2adj=as.numeric(Results_lm_ATT$R2adj)
+Results_lm_ATT$Coef=as.numeric(Results_lm_ATT$Coef)
+Results_lm_ATT$pvallm=as.numeric(Results_lm_ATT$pvallm)
+Results_lm_ATT$pvallm.adj=p.adjust(Results_lm_ATT$pvallm, method="BH")
+Results_lm_ATT$corspear=as.numeric(Results_lm_ATT$corspear)
+Results_lm_ATT$pvalspear=as.numeric(Results_lm_ATT$pvalspear)
+Results_lm_ATT$pvalspear.adj=p.adjust(Results_lm_ATT$pvalspear, method="BH")
+summary(Results_lm_ATT)
+
+# Doesn't look as promising
+Results_lm_ATT[which(Results_lm_ATT$pvalspear<0.05),] %>% arrange(desc(corspear))
+Results_lm_ATT[which(Results_lm_ATT$pvalspear<0.05 & Results_lm_ATT$corspear>0),] %>% arrange(desc(corspear)) # 2 have coeff >0 and none passes the adjustment
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_ATT[,"UreD urease accessory protein"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_ATT[,"UreD urease accessory protein"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_ATT$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="UreD urease accessory protein (EggNOG annotation)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_ATT[,"Facilitates the functional incorporation of the urease nickel metallocenter. This process requires GTP hydrolysis, probably effectuated by UreG"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_ATT[,"Facilitates the functional incorporation of the urease nickel metallocenter. This process requires GTP hydrolysis, probably effectuated by UreG"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_ATT$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="Facilitates the functional incorporation of the urease nickel metallocenter. This process requires GTP hydrolysis, probably effectuated by UreG (EggNOG annotation)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_ATT[,"UreE urease accessory protein, N-terminal domain"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_ATT[,"UreE urease accessory protein, N-terminal domain"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_ATT$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="UreE urease accessory protein, N-terminal domain (EggNOG annotation)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+# --> irrelevant
+```
+
+# PFAM annotation level
+```{r PFAM}
+PFAM_IDs=unique(AnnotFull$PFAMs)[!is.na(unique(AnnotFull$PFAMs))]
+
+#Initiate matrix :
+PFAM_matrix_FL=GeneMat_Nickel_FL[,1:length(PFAM_IDs)]
+#Fill matrix
+for (i in c(1:length(PFAM_IDs))) {
+  PFAM_matrix_FL[,i]=rowMeans(GeneMat_Nickel_FL[,which(names(GeneMat_Nickel_FL) %in% AnnotFull[which(AnnotFull$PFAMs==PFAM_IDs[i]),"Gene_ID"]),drop=F])
+  PFAM_matrix_FL[,i][is.na(PFAM_matrix_FL[,i])] = 0
+  names(PFAM_matrix_FL)[i]=PFAM_IDs[i]
+}
+PFAM_matrix_FL=PFAM_matrix_FL[,-which(colSums(PFAM_matrix_FL)==0)]
+#
+
+#Initiate matrix :
+PFAM_matrix_ATT=GeneMat_Nickel_ATT[,1:length(PFAM_IDs)]
+#Fill matrix
+for (i in c(1:length(PFAM_IDs))) {
+  PFAM_matrix_ATT[,i]=rowMeans(GeneMat_Nickel_ATT[,which(names(GeneMat_Nickel_ATT) %in% AnnotFull[which(AnnotFull$PFAMs==PFAM_IDs[i]),"Gene_ID"]), drop=F])
+  PFAM_matrix_ATT[,i][is.na(PFAM_matrix_ATT[,i])] = 0
+  names(PFAM_matrix_ATT)[i]=PFAM_IDs[i]
+}
+PFAM_matrix_ATT=PFAM_matrix_ATT[,-which(colSums(PFAM_matrix_ATT)==0)]
+
+# FL size fraction
+
+Results_lm_FL=data.frame(PFAM_ID=c("PFAM_ID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+PFAM_matrix_FL=PFAM_matrix_FL[match(meta_nickel_FL$ACE_seq_name,row.names(PFAM_matrix_FL)),]
+
+for (i in c(1:ncol(PFAM_matrix_FL))) {
+  res=lm(PFAM_matrix_FL[,i]~meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(PFAM_matrix_FL)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(PFAM_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(PFAM_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_FL[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_FL$PFAM_ID=as.factor(Results_lm_FL$PFAM_ID)
+Results_lm_FL$R2adj=as.numeric(Results_lm_FL$R2adj)
+Results_lm_FL$Coef=as.numeric(Results_lm_FL$Coef)
+Results_lm_FL$pvallm=as.numeric(Results_lm_FL$pvallm)
+Results_lm_FL$pvallm.adj=p.adjust(Results_lm_FL$pvallm, method="BH")
+Results_lm_FL$corspear=as.numeric(Results_lm_FL$corspear)
+Results_lm_FL$pvalspear=as.numeric(Results_lm_FL$pvalspear)
+Results_lm_FL$pvalspear.adj=p.adjust(Results_lm_FL$pvalspear, method="BH")
+summary(Results_lm_FL)
+# Some spearman might be worth investigating
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05),] %>% arrange(desc(corspear)) #A few significant according to spearman pre-correction
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05 & Results_lm_FL$corspear>0),] %>% arrange(desc(corspear)) # Only 3 have coeff >0 and none passes the adjustment
+
+ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_FL[,"Sod_Ni"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=PFAM_matrix_FL[,"Sod_Ni"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_FL$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="Sod_Ni", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+# Seems nice, maybe significant without Mertz
+
+ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_FL[,"LysE,UDG"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=PFAM_matrix_FL[,"LysE,UDG"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_FL$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="LysE,UDG", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+# Not particularly high in station 8/11
+
+# Again, mertz seems to disturb the relationship. Let's try without it :
+Results_lm_FL=data.frame(PFAM_ID=c("PFAM_ID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+PFAM_matrix_FL_nomertz=PFAM_matrix_FL[match(meta_nickel_FL_nomertz$ACE_seq_name,row.names(PFAM_matrix_FL)),]
+
+for (i in c(1:ncol(PFAM_matrix_FL_nomertz))) {
+  res=lm(PFAM_matrix_FL_nomertz[,i]~meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(PFAM_matrix_FL_nomertz)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(PFAM_matrix_FL_nomertz[,i],meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(PFAM_matrix_FL_nomertz[,i],meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_FL[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_FL$PFAM_ID=as.factor(Results_lm_FL$PFAM_ID)
+Results_lm_FL$R2adj=as.numeric(Results_lm_FL$R2adj)
+Results_lm_FL$Coef=as.numeric(Results_lm_FL$Coef)
+Results_lm_FL$pvallm=as.numeric(Results_lm_FL$pvallm)
+Results_lm_FL$pvallm.adj=p.adjust(Results_lm_FL$pvallm, method="BH")
+Results_lm_FL$corspear=as.numeric(Results_lm_FL$corspear)
+Results_lm_FL$pvalspear=as.numeric(Results_lm_FL$pvalspear)
+Results_lm_FL$pvalspear.adj=p.adjust(Results_lm_FL$pvalspear, method="BH")
+summary(Results_lm_FL)
+# Some spearman might be worth investigating
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05),] %>% arrange(desc(corspear)) #9 significant according to spearman pre-correction, highest coeff = LysE,UDG and SOD_Ni
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05 & Results_lm_FL$corspear>0),] %>% arrange(desc(corspear)) # 7 have coeff >0 and none passes the adjustment
+
+ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_FL_nomertz[,"Sod_Ni"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=PFAM_matrix_FL_nomertz[,"Sod_Ni"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE), size=3) +
+  theme_bw() +
+  labs(y="Sod_Ni", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_FL_nomertz[,"LysE,UDG"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=PFAM_matrix_FL_nomertz[,"LysE,UDG"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE), size=3) +
+  theme_bw() +
+  labs(y="LysE,UDG", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+# ATT size fraction
+
+Results_lm_ATT=data.frame(PFAM_ID=c("PFAM_ID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+PFAM_matrix_ATT=PFAM_matrix_ATT[match(meta_nickel_ATT$ACE_seq_name,row.names(PFAM_matrix_ATT)),]
+
+for (i in c(1:ncol(PFAM_matrix_ATT))) {
+  res=lm(PFAM_matrix_ATT[,i]~meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(PFAM_matrix_ATT)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(PFAM_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(PFAM_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_ATT[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_ATT$PFAM_ID=as.factor(Results_lm_ATT$PFAM_ID)
+Results_lm_ATT$R2adj=as.numeric(Results_lm_ATT$R2adj)
+Results_lm_ATT$Coef=as.numeric(Results_lm_ATT$Coef)
+Results_lm_ATT$pvallm=as.numeric(Results_lm_ATT$pvallm)
+Results_lm_ATT$pvallm.adj=p.adjust(Results_lm_ATT$pvallm, method="BH")
+Results_lm_ATT$corspear=as.numeric(Results_lm_ATT$corspear)
+Results_lm_ATT$pvalspear=as.numeric(Results_lm_ATT$pvalspear)
+Results_lm_ATT$pvalspear.adj=p.adjust(Results_lm_ATT$pvalspear, method="BH")
+summary(Results_lm_ATT)
+# Some spearman might be worth investigating
+Results_lm_ATT[which(Results_lm_ATT$pvalspear<0.05),] %>% arrange(desc(corspear)) # 3 significant according to spearman pre-correction
+Results_lm_ATT[which(Results_lm_ATT$pvalspear<0.05 & Results_lm_ATT$corspear>0),] %>% arrange(desc(corspear)) # Nothing interesting, let's check the one that was good with relab :
+
+Results_lm_ATT[which(Results_lm_ATT$PFAM_ID=="UreD,UreF"),]
+
+ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_ATT[,"UreD,UreF"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=PFAM_matrix_ATT[,"UreD,UreF"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_ATT$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="UreD,UreF", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+# The jump at Mertz is still there, only the rest is even less organized.
+
+```

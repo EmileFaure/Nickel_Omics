@@ -1,0 +1,965 @@
+---
+title: "NickelOmics"
+date: "2025-04-18"
+author: "Emile Faure"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: united
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+require(tidyverse)
+require(reshape2)
+require(RColorBrewer)
+require(ComplexHeatmap)
+require(dendextend)
+require(circlize)
+require(viridis)
+require(naniar)
+require(pals)
+require(PermCor)
+require(vegan)
+library(gridExtra)
+library(data.table)
+
+lmp <- function (modelobject) {
+  if (class(modelobject) != "lm") stop("Not an object of class 'lm' ")
+  f <- summary(modelobject)$fstatistic
+  p <- pf(f[1],f[2],f[3],lower.tail=F)
+  attributes(p) <- NULL
+  return(p)
+}
+
+source("/Users/emifaure/Documents/TONGA/StageMilo/PetB_Corr_Heatmaps_RDA/scoresRDA.R")
+
+```
+
+# Load metadata
+```{r load metadata}
+########## Load metadata ############
+
+meta <- read.table(file = "/Users/emifaure/Documents/ACE/MetaData/ACE_metadata/Metadata_For_Submission/meta_CTD_ForSubmission.csv", 
+                   header=TRUE, sep = ";", dec = ".", stringsAsFactors = FALSE)
+meta <- meta %>% 
+  mutate_if(.predicate = is.character, .funs = as.factor)
+
+# Load list of metagenomes
+metagenomes <- read.table("/Users/emifaure/Documents/ACE/Metagenomics/ACEsamples_With_Ace_seq_name.tsv", header = TRUE)
+
+# Load Nickel dataset
+Nickel=read.table("/Users/emifaure/Documents/ACE/NolwennCollab/NickelData.txt", sep="\t", header=T, dec=",")
+meta_nickel = meta %>% inner_join(Nickel, by=c("TM_station_number","Depth_m")) %>%
+  filter(!is.na(Ni_60_58_D_DELTA_BOTTLE))
+# 85 ACE_seq_Name have a nickel values, how many in out sequenced metagenomes ?
+
+meta_nickel = meta_nickel[which(meta_nickel$ACE_seq_name %in% metagenomes$ace_seq_name),]
+# we have 48 metagenomes that can be associated with an isotopic value
+
+```
+
+# Load metagenomics data
+```{r load metag and annot}
+########## Load Metagnomics data ############
+
+# CDHit clusters of interest were selected according to their functional annotations:
+#  - Annotations containing one of the words "urease", "NiFe", ["superoxide"+"dismutase"] in eggNOG annotation file
+#  - Annotations as KEGG ID corresponding to an urease, NiFe hydrgenase or superoxide dismutase
+
+# The relative transformed RLE data (makes sense to sum them, reflect % of mapped reads in sample):
+GeneMat = read.table("/Users/emifaure/Documents/ACE/NolwennCollab/Post_Review/GM_CDHit_relative-trans_MetalloEnzymes.tsv", sep="\t", header=T)
+
+# The sample names are not in ACE_Seq format, we make the conversion :
+for (i in 2:ncol(GeneMat)){
+  names(GeneMat)[i] <- sub("_SORTED", "", names(GeneMat)[i])
+  names(GeneMat)[i] <- metagenomes$ace_seq_name[which(metagenomes$sample==names(GeneMat)[i])]
+}
+row.names(GeneMat)=GeneMat$CDHit_ID
+GeneMat_Nickel = GeneMat[,names(GeneMat) %in% meta_nickel$ACE_seq_name]
+GeneMat_Nickel=as.data.frame(t(GeneMat_Nickel))
+
+# Results from the ACE metagenomics catalog showed that abundance patterns can be extremely different across size fractions for one AGC, and it should make more sense to divide between A (>3 micrometers, attached and eukaryotes) and B+C (0.2-3 and 0.2-40 micrometers, which are dominated by prokaryotes).
+meta_nickel_FL = meta_nickel[-which(meta_nickel$Size_fraction==">3 µm"),]
+meta_nickel_ATT = meta_nickel[which(meta_nickel$Size_fraction==">3 µm"),]
+GeneMat_Nickel_FL = GeneMat_Nickel[row.names(GeneMat_Nickel) %in% meta_nickel_FL$ACE_seq_name,]
+GeneMat_Nickel_FL=GeneMat_Nickel_FL[match(meta_nickel_FL$ACE_seq_name,row.names(GeneMat_Nickel_FL)),]
+#Remove columns of only 0
+GeneMat_Nickel_FL = GeneMat_Nickel_FL[,-which(colSums(GeneMat_Nickel_FL)==0)]
+GeneMat_Nickel_ATT = GeneMat_Nickel[row.names(GeneMat_Nickel) %in% meta_nickel_ATT$ACE_seq_name,]
+GeneMat_Nickel_ATT=GeneMat_Nickel_ATT[match(meta_nickel_ATT$ACE_seq_name,row.names(GeneMat_Nickel_ATT)),]
+#Remove columns of only 0
+GeneMat_Nickel_ATT = GeneMat_Nickel_ATT[,-which(colSums(GeneMat_Nickel_ATT)==0)]
+
+# Load functional annotations for the CD-Hit clusters
+AnnotFull=read.table("/Users/emifaure/Documents/ACE/NolwennCollab/Annotations_CDHit_Metallo.tsv", sep="\t", header=F,fill=T, quote = '', na.strings =c('','-'))
+names(AnnotFull)=c("Gene_ID","AGC_ID","AGC_Rep","AGC_Size","AGC_Cat","Singl_Cat","CDHit_Rep","Domain","KEGG","seed_ortholog","eggNOG_OGs","narr_OG_name","narr_OG_cat","narr_OG_desc","best_OG_name","best_OG_cat","best_OG_desc","Preferred_name","CAZy","BiGG_Reaction","PFAMs")
+AnnotTransport=read.table("/Users/emifaure/Documents/ACE/NolwennCollab/Annotations_CDHit_nickeltransport.tsv", sep="\t", header=F,fill=T, quote = '', na.strings =c('','-'))
+names(AnnotTransport)=c("Gene_ID","AGC_ID","AGC_Rep","AGC_Size","AGC_Cat","Singl_Cat","CDHit_Rep","Domain","KEGG","seed_ortholog","eggNOG_OGs","narr_OG_name","narr_OG_cat","narr_OG_desc","best_OG_name","best_OG_cat","best_OG_desc","Preferred_name","CAZy","BiGG_Reaction","PFAMs")
+
+```
+
+# Broad Functional level investigations
+```{r Function}
+# First we will agreggate the CD-Hit clusters by broad functional type
+Func_simplify <- rep("Unclassified",nrow(AnnotFull))
+Func_simplify[grepl("urease", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("ure", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("Ure", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("K03190", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("K03189", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("K03188", do.call(paste0, AnnotFull), ignore.case=TRUE)]="Urease"
+Func_simplify[grepl("NiFe", do.call(paste0, AnnotFull), ignore.case=TRUE)]="NiFe Hydrogenase"
+Func_simplify[grepl("hydrogenase", do.call(paste0, AnnotFull), ignore.case=TRUE)]="NiFe Hydrogenase"
+Func_simplify[grepl("superoxide", do.call(paste0, AnnotFull), ignore.case=TRUE)]="SOD"
+Func_simplify[grepl("sod", do.call(paste0, AnnotFull), ignore.case=TRUE)]="SOD"
+Func_simplify[grepl("Sod_", do.call(paste0, AnnotFull), ignore.case=TRUE)]="SOD"
+Func_simplify[grepl("K04565", do.call(paste0, AnnotFull), ignore.case=TRUE)]="SOD"
+
+AnnotFull$FuncSimplify <- Func_simplify
+
+Enzyme_IDs=unique(AnnotFull$FuncSimplify)[!is.na(unique(AnnotFull$FuncSimplify))]
+
+#Initiate matrix for FL:
+Enzyme_matrix_FL=GeneMat_Nickel_FL[,1:length(Enzyme_IDs)]
+#Fill matrix
+for (i in c(1:length(Enzyme_IDs))) {
+  Enzyme_matrix_FL[,i]=rowSums(GeneMat_Nickel_FL[,which(names(GeneMat_Nickel_FL) %in% AnnotFull[which(AnnotFull$FuncSimplify==Enzyme_IDs[i]),"Gene_ID"]),drop=F])
+  names(Enzyme_matrix_FL)[i]=Enzyme_IDs[i]
+}
+
+#Initiate matrix for ATT:
+Enzyme_matrix_ATT=GeneMat_Nickel_ATT[,1:length(Enzyme_IDs)]
+#Fill matrix
+for (i in c(1:length(Enzyme_IDs))) {
+  Enzyme_matrix_ATT[,i]=rowSums(GeneMat_Nickel_ATT[,which(names(GeneMat_Nickel_ATT) %in% AnnotFull[which(AnnotFull$FuncSimplify==Enzyme_IDs[i]),"Gene_ID"]),drop=F])
+  names(Enzyme_matrix_ATT)[i]=Enzyme_IDs[i]
+}
+
+# Add the nickel data and metadata
+EnzymeFL_Ni = merge(Enzyme_matrix_FL,meta_nickel_FL,by.x="row.names",by.y="ACE_seq_name")
+EnzymeATT_Ni = merge(Enzyme_matrix_ATT,meta_nickel_ATT,by.x="row.names",by.y="ACE_seq_name")
+
+# Plots
+
+# FL SF :
+EnzymeFL_Ni_plot <- EnzymeFL_Ni %>% select(SOD,Urease,`NiFe Hydrogenase`,Ni_60_58_D_DELTA_BOTTLE,MertzGlacier) %>%
+  pivot_longer(-c(Ni_60_58_D_DELTA_BOTTLE,MertzGlacier),names_to = "Enzyme",values_to = "Abundance") %>%
+  mutate(Enzyme = fct_relevel(Enzyme, 
+                              "NiFe Hydrogenase", "SOD", "Urease"))
+
+
+ggplot(EnzymeFL_Ni_plot) + 
+  geom_smooth(aes(x=Ni_60_58_D_DELTA_BOTTLE,y=Abundance*100,col=Enzyme),method="lm",alpha=0.2) +
+  geom_point(aes(x=Ni_60_58_D_DELTA_BOTTLE,y=Abundance*100,col=Enzyme,shape=MertzGlacier),size=3) +
+  scale_color_brewer(palette = "Dark2") +
+  theme_bw() +
+  labs(y="Metagenomic relative abundance (% of coverage)", x=expression(delta^60 * Ni ~ "(‰)"), shape="Mertz Glacier") +
+  theme(text = element_text(size = 16)) +
+  facet_wrap(~Enzyme,scales = "free",nrow = 1)
+
+testFL <- data.frame(Enzyme=c("SOD","Urease","NiFe Hydrogenase"),pval=rep(0,3), coef=rep(0,3), R2=rep(0,3))
+for(i in c(1:3)) {
+  testFL$pval[i] <- perm_test(EnzymeFL_Ni[,testFL$Enzyme[i]],EnzymeFL_Ni$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided", B=1000)$p.value
+  res=lm(EnzymeFL_Ni[,testFL$Enzyme[i]]~EnzymeFL_Ni$Ni_60_58_D_DELTA_BOTTLE)
+  testFL$R2[i]=summary(res)$adj.r.squared
+  testFL$coef[i]=res$coefficients[2]
+}
+testFL$pvalspear.adj=p.adjust(testFL$pval, method="BH")
+testFL
+
+# Try without Mertz :
+EnzymeFL_Ni_nomertz <- EnzymeFL_Ni[-which(EnzymeFL_Ni$MertzGlacier==TRUE),]
+testFL <- data.frame(Enzyme=c("SOD","Urease","NiFe Hydrogenase"),pval=rep(0,3))
+for(i in c(1:3)) {
+  testFL$pval[i] <- perm_test(EnzymeFL_Ni_nomertz[,testFL$Enzyme[i]],EnzymeFL_Ni_nomertz$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided", B=1000)$p.value
+}
+testFL$pvalspear.adj=p.adjust(testFL$pval, method="BH")
+testFL
+
+# ATT SF :
+EnzymeATT_Ni_plot <- EnzymeATT_Ni %>% select(SOD,Urease,`NiFe Hydrogenase`,Ni_60_58_D_DELTA_BOTTLE,MertzGlacier) %>%
+  pivot_longer(-c(Ni_60_58_D_DELTA_BOTTLE,MertzGlacier),names_to = "Enzyme",values_to = "Abundance") %>%
+  mutate(Enzyme = fct_relevel(Enzyme, 
+                              "NiFe Hydrogenase", "SOD", "Urease"))
+
+
+ggplot(EnzymeATT_Ni_plot) + 
+  geom_smooth(aes(x=Ni_60_58_D_DELTA_BOTTLE,y=Abundance*100,col=Enzyme),method="lm",alpha=0.2) +
+  geom_point(aes(x=Ni_60_58_D_DELTA_BOTTLE,y=Abundance*100,col=Enzyme,shape=MertzGlacier),size=3) +
+  scale_color_brewer(palette = "Dark2") +
+  theme_bw() +
+  labs(y="Metagenomic relative abundance (% of coverage)", x=expression(delta^60 * Ni ~ "(‰)"), shape="Mertz Glacier") +
+  theme(text = element_text(size = 16)) +
+  facet_wrap(~Enzyme,scales = "free",nrow=1)
+#ggsave("Documents/ACE/NolwennCollab/Post_Review/Figure3_PanelB_PostReview_relab_V2.pdf",width = 40, height = 15, units = "cm", device = cairo_pdf)
+
+testATT <- data.frame(Enzyme=c("SOD","Urease","NiFe Hydrogenase"),pval=rep(0,3), coef=rep(0,3), R2=rep(0,3))
+for(i in c(1:3)) {
+  testATT$pval[i] <- perm_test(EnzymeATT_Ni[,testATT$Enzyme[i]],EnzymeATT_Ni$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided", B=1000)$p.value
+  res=lm(EnzymeATT_Ni[,testATT$Enzyme[i]]~EnzymeATT_Ni$Ni_60_58_D_DELTA_BOTTLE)
+  testATT$R2[i]=summary(res)$adj.r.squared
+  testATT$coef[i]=res$coefficients[2]
+}
+testATT$pvalspear.adj=p.adjust(testATT$pval, method="BH")
+testATT
+
+```
+# KEGG Functional level investigations
+```{r KEGG}
+KEGG_IDs=unique(AnnotFull$KEGG)[!is.na(unique(AnnotFull$KEGG))]
+
+#Initiate matrix :
+KEGG_matrix_FL=GeneMat_Nickel_FL[,1:length(KEGG_IDs)]
+#Fill matrix
+for (i in c(1:length(KEGG_IDs))) {
+  KEGG_matrix_FL[,i]=rowSums(GeneMat_Nickel_FL[,which(names(GeneMat_Nickel_FL) %in% AnnotFull[which(AnnotFull$KEGG==KEGG_IDs[i]),"Gene_ID"]),drop=F])
+  names(KEGG_matrix_FL)[i]=KEGG_IDs[i]
+}
+KEGG_matrix_FL=KEGG_matrix_FL[,-which(colSums(KEGG_matrix_FL)==0)]
+
+#Initiate matrix :
+KEGG_matrix_ATT=GeneMat_Nickel_ATT[,1:length(KEGG_IDs)]
+#Fill matrix
+for (i in c(1:length(KEGG_IDs))) {
+  KEGG_matrix_ATT[,i]=rowSums(GeneMat_Nickel_ATT[,which(names(GeneMat_Nickel_ATT) %in% AnnotFull[which(AnnotFull$KEGG==KEGG_IDs[i]),"Gene_ID"]), drop=F])
+  names(KEGG_matrix_ATT)[i]=KEGG_IDs[i]
+}
+KEGG_matrix_ATT=KEGG_matrix_ATT[,-which(colSums(KEGG_matrix_ATT)==0)]
+
+# FL size fraction
+
+Results_lm_FL=data.frame(KEGG_ID=c("KEGGID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+KEGG_matrix_FL=KEGG_matrix_FL[match(meta_nickel_FL$ACE_seq_name,row.names(KEGG_matrix_FL)),]
+
+for (i in c(1:ncol(KEGG_matrix_FL))) {
+  res=lm(KEGG_matrix_FL[,i]~meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(KEGG_matrix_FL)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(KEGG_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(KEGG_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_FL[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_FL$KEGG_ID=as.factor(Results_lm_FL$KEGG_ID)
+Results_lm_FL$R2adj=as.numeric(Results_lm_FL$R2adj)
+Results_lm_FL$Coef=as.numeric(Results_lm_FL$Coef)
+Results_lm_FL$pvallm=as.numeric(Results_lm_FL$pvallm)
+Results_lm_FL$pvallm.adj=p.adjust(Results_lm_FL$pvallm, method="BH")
+Results_lm_FL$corspear=as.numeric(Results_lm_FL$corspear)
+Results_lm_FL$pvalspear=as.numeric(Results_lm_FL$pvalspear)
+Results_lm_FL$pvalspear.adj=p.adjust(Results_lm_FL$pvalspear, method="BH")
+summary(Results_lm_FL)
+# Nothing worth going further
+
+# ATT size fraction
+
+Results_lm_ATT=data.frame(KEGG_ID=c("KEGGID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0),
+                          corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+KEGG_matrix_ATT=KEGG_matrix_ATT[match(meta_nickel_ATT$ACE_seq_name,row.names(KEGG_matrix_ATT)),]
+
+for (i in c(1:ncol(KEGG_matrix_ATT))) {
+  res=lm(KEGG_matrix_ATT[,i]~meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(KEGG_matrix_ATT)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(KEGG_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(KEGG_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_ATT[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_ATT$KEGG_ID=as.factor(Results_lm_ATT$KEGG_ID)
+Results_lm_ATT$R2adj=as.numeric(Results_lm_ATT$R2adj)
+Results_lm_ATT$Coef=as.numeric(Results_lm_ATT$Coef)
+Results_lm_ATT$pvallm=as.numeric(Results_lm_ATT$pvallm)
+Results_lm_ATT$pvallm.adj=p.adjust(Results_lm_ATT$pvallm, method="BH")
+Results_lm_ATT$corspear=as.numeric(Results_lm_ATT$corspear)
+Results_lm_ATT$pvalspear=as.numeric(Results_lm_ATT$pvalspear)
+Results_lm_ATT$pvalspear.adj=p.adjust(Results_lm_ATT$pvalspear, method="BH")
+summary(Results_lm_ATT)
+
+Results_lm_ATT[Results_lm_ATT$pvalspear.adj<0.05,] # This KO is absent everywhere but one sample
+# Nothing worth going further
+
+```
+
+# EggNOG Functional level investigations
+```{r EggNOG}
+EggNOG_IDs=unique(AnnotFull$best_OG_desc)[!is.na(unique(AnnotFull$best_OG_desc))]
+
+#Initiate matrix :
+EggNOG_matrix_FL=GeneMat_Nickel_FL[,1:length(EggNOG_IDs)]
+#Fill matrix
+for (i in c(1:length(EggNOG_IDs))) {
+  EggNOG_matrix_FL[,i]=rowSums(GeneMat_Nickel_FL[,which(names(GeneMat_Nickel_FL) %in% AnnotFull[which(AnnotFull$best_OG_desc==EggNOG_IDs[i]),"Gene_ID"]),drop=F])
+  names(EggNOG_matrix_FL)[i]=EggNOG_IDs[i]
+}
+EggNOG_matrix_FL=EggNOG_matrix_FL[,-which(colSums(EggNOG_matrix_FL)==0)]
+#
+
+#Initiate matrix :
+EggNOG_matrix_ATT=GeneMat_Nickel_ATT[,1:length(EggNOG_IDs)]
+#Fill matrix
+for (i in c(1:length(EggNOG_IDs))) {
+  EggNOG_matrix_ATT[,i]=rowSums(GeneMat_Nickel_ATT[,which(names(GeneMat_Nickel_ATT) %in% AnnotFull[which(AnnotFull$best_OG_desc==EggNOG_IDs[i]),"Gene_ID"]), drop=F])
+  names(EggNOG_matrix_ATT)[i]=EggNOG_IDs[i]
+}
+EggNOG_matrix_ATT=EggNOG_matrix_ATT[,-which(colSums(EggNOG_matrix_ATT)==0)]
+
+# FL size fraction
+
+Results_lm_FL=data.frame(EggNOG_ID=c("EggNOGID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+EggNOG_matrix_FL=EggNOG_matrix_FL[match(meta_nickel_FL$ACE_seq_name,row.names(EggNOG_matrix_FL)),]
+
+for (i in c(1:ncol(EggNOG_matrix_FL))) {
+  res=lm(EggNOG_matrix_FL[,i]~meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(EggNOG_matrix_FL)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(EggNOG_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(EggNOG_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_FL[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_FL$EggNOG_ID=as.factor(Results_lm_FL$EggNOG_ID)
+Results_lm_FL$R2adj=as.numeric(Results_lm_FL$R2adj)
+Results_lm_FL$Coef=as.numeric(Results_lm_FL$Coef)
+Results_lm_FL$pvallm=as.numeric(Results_lm_FL$pvallm)
+Results_lm_FL$pvallm.adj=p.adjust(Results_lm_FL$pvallm, method="BH")
+Results_lm_FL$corspear=as.numeric(Results_lm_FL$corspear)
+Results_lm_FL$pvalspear=as.numeric(Results_lm_FL$pvalspear)
+Results_lm_FL$pvalspear.adj=p.adjust(Results_lm_FL$pvalspear, method="BH")
+summary(Results_lm_FL)
+# Some spearman might be worth investigating
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05),] %>% arrange(desc(corspear)) #14 significant according to spearman pre-correction, highest coeff = SOD
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05 & Results_lm_FL$corspear>0),] %>% arrange(desc(corspear)) # Only 5 have coeff >0 and one passes the adjustment
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL[,"COG2370 Hydrogenase urease accessory protein"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_FL[,"COG2370 Hydrogenase urease accessory protein"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_FL$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="COG2370 Hydrogenase urease accessory protein", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL[,"Superoxide dismutase"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_FL[,"Superoxide dismutase"],x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_FL$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="Superoxide dismutase", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+# Again, mertz seems to disturb the relationship. Let's try without it :
+Results_lm_FL=data.frame(EggNOG_ID=c("EggNOGID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+meta_nickel_FL_nomertz<-meta_nickel_FL[-which(meta_nickel_FL$MertzGlacier==TRUE),]
+EggNOG_matrix_FL_nomertz=EggNOG_matrix_FL[match(meta_nickel_FL_nomertz$ACE_seq_name,row.names(EggNOG_matrix_FL)),]
+
+for (i in c(1:ncol(EggNOG_matrix_FL_nomertz))) {
+  res=lm(EggNOG_matrix_FL_nomertz[,i]~meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(EggNOG_matrix_FL_nomertz)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(EggNOG_matrix_FL_nomertz[,i],meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(EggNOG_matrix_FL_nomertz[,i],meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_FL[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_FL$EggNOG_ID=as.factor(Results_lm_FL$EggNOG_ID)
+Results_lm_FL$R2adj=as.numeric(Results_lm_FL$R2adj)
+Results_lm_FL$Coef=as.numeric(Results_lm_FL$Coef)
+Results_lm_FL$pvallm=as.numeric(Results_lm_FL$pvallm)
+Results_lm_FL$pvallm.adj=p.adjust(Results_lm_FL$pvallm, method="BH")
+Results_lm_FL$corspear=as.numeric(Results_lm_FL$corspear)
+Results_lm_FL$pvalspear=as.numeric(Results_lm_FL$pvalspear)
+Results_lm_FL$pvalspear.adj=p.adjust(Results_lm_FL$pvalspear, method="BH")
+summary(Results_lm_FL)
+# Some spearman might be worth investigating
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05),] %>% arrange(desc(corspear)) #17 significant according to spearman pre-correction, highest coeff = SOD
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05 & Results_lm_FL$corspear>0),] %>% arrange(desc(corspear)) # 6 have coeff >0 and 3 passes the adjustment
+#Superoxide dismutase
+#uracil-DNA glycosylase (narrow og desc = UreE urease accessory protein)
+#COG2370 Hydrogenase urease accessory protein
+EggNOG_matrix_FL_nomertz[,"uracil-DNA glycosylase"]
+EggNOG_matrix_FL_nomertz[,"COG2370 Hydrogenase urease accessory protein"]
+
+# 2 have adj p-values<0.01
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL_nomertz[,"Superoxide dismutase"]*100,x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_FL_nomertz[,"Superoxide dismutase"]*100,x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE), size=3) +
+  theme_bw() +
+  labs(y="Superoxide dismutase (EggNOG best OG, % of coverage)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL_nomertz[,"COG2370 Hydrogenase urease accessory protein"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_FL_nomertz[,"COG2370 Hydrogenase urease accessory protein"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE), size=3) +
+  theme_bw() +
+  labs(y="COG2370 Hydrogenase urease accessory protein (EggNOG best OG description)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL_nomertz[,"uracil-DNA glycosylase"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_FL_nomertz[,"uracil-DNA glycosylase"],x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_FL_nomertz$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="uracil-DNA glycosylase (EggNOG best OG description)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+# ATT size fraction
+
+Results_lm_ATT=data.frame(EggNOG_ID=c("EggNOGID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+EggNOG_matrix_ATT=EggNOG_matrix_ATT[match(meta_nickel_ATT$ACE_seq_name,row.names(EggNOG_matrix_ATT)),]
+
+for (i in c(1:ncol(EggNOG_matrix_ATT))) {
+  res=lm(EggNOG_matrix_ATT[,i]~meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(EggNOG_matrix_ATT)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(EggNOG_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(EggNOG_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_ATT[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_ATT$EggNOG_ID=as.factor(Results_lm_ATT$EggNOG_ID)
+Results_lm_ATT$R2adj=as.numeric(Results_lm_ATT$R2adj)
+Results_lm_ATT$Coef=as.numeric(Results_lm_ATT$Coef)
+Results_lm_ATT$pvallm=as.numeric(Results_lm_ATT$pvallm)
+Results_lm_ATT$pvallm.adj=p.adjust(Results_lm_ATT$pvallm, method="BH")
+Results_lm_ATT$corspear=as.numeric(Results_lm_ATT$corspear)
+Results_lm_ATT$pvalspear=as.numeric(Results_lm_ATT$pvalspear)
+Results_lm_ATT$pvalspear.adj=p.adjust(Results_lm_ATT$pvalspear, method="BH")
+summary(Results_lm_ATT)
+
+# Doesn't look as promising
+Results_lm_ATT[which(Results_lm_ATT$pvalspear<0.05),] %>% arrange(desc(corspear))
+Results_lm_ATT[which(Results_lm_ATT$pvalspear<0.05 & Results_lm_ATT$corspear>0),] %>% arrange(desc(corspear)) # 6 have coeff >0 and 3 passes the adjustment
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_ATT[,"UreD urease accessory protein"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_ATT[,"UreD urease accessory protein"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_ATT$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="UreD urease accessory protein (EggNOG annotation)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_ATT[,"Facilitates the functional incorporation of the urease nickel metallocenter. This process requires GTP hydrolysis, probably effectuated by UreG"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_ATT[,"Facilitates the functional incorporation of the urease nickel metallocenter. This process requires GTP hydrolysis, probably effectuated by UreG"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_ATT$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="UreD urease accessory protein (EggNOG annotation)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_ATT[,"COG1573 Uracil-DNA glycosylase"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=EggNOG_matrix_ATT[,"COG1573 Uracil-DNA glycosylase"],x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_ATT$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="COG1573 Uracil-DNA glycosylase (EggNOG annotation)", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+# --> Basically present in one spot only, irrelevant
+
+# --> Clean figures with the most interesting ones
+g1 <- ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL_nomertz[,"Superoxide dismutase"]*100,x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2, col="grey20") +
+  geom_point(aes(y=EggNOG_matrix_FL[,"Superoxide dismutase"]*100,x=meta_nickel_FL[, "Ni_60_58_D_DELTA_BOTTLE"], shape=meta_nickel_FL[, "MertzGlacier"], col=meta_nickel_FL[, "MertzGlacier"]), size=3) +
+  scale_color_manual(values=c("black","skyblue")) +
+  theme_bw() +
+  labs(y="Superoxide dismutase\n(EggNOG best OG description, % of coverage)", x=expression(delta^60 * Ni ~ "(‰)"), shape="Mertz Glacier", col="Mertz Glacier") +
+  theme(text = element_text(size = 16))
+g1
+
+g2 <- ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_FL_nomertz[,"COG2370 Hydrogenase urease accessory protein"]*100,x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2, col="grey20") +
+  geom_point(aes(y=EggNOG_matrix_FL[,"COG2370 Hydrogenase urease accessory protein"]*100,x=meta_nickel_FL[, "Ni_60_58_D_DELTA_BOTTLE"], shape=meta_nickel_FL[, "MertzGlacier"], col=meta_nickel_FL[, "MertzGlacier"]), size=3) +
+  scale_color_manual(values=c("black","skyblue")) +
+  theme_bw() +
+  labs(y="COG2370 Hydrogenase urease accessory protein\n(EggNOG best OG description, % of coverage)", x=expression(delta^60 * Ni ~ "(‰)"), shape= "Mertz Glacier", col="Mertz Glacier") +
+  theme(text = element_text(size = 16))
+g2
+
+g3 <- ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_ATT[,"UreD urease accessory protein"]*100,x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2, col="grey20") +
+  geom_point(aes(y=EggNOG_matrix_ATT[,"UreD urease accessory protein"]*100,x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_ATT$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="UreD urease accessory protein\n(EggNOG best OG description, % of coverage)", x=expression(delta^60 * Ni ~ "(‰)"), shape= "Mertz Glacier") +
+  theme(text = element_text(size = 16))
+g3
+
+g4 <- ggplot() + 
+  geom_smooth(aes(y=EggNOG_matrix_ATT[,"Facilitates the functional incorporation of the urease nickel metallocenter. This process requires GTP hydrolysis, probably effectuated by UreG"]*100,x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2, col="grey20") +
+  geom_point(aes(y=EggNOG_matrix_ATT[,"Facilitates the functional incorporation of the urease nickel metallocenter. This process requires GTP hydrolysis, probably effectuated by UreG"]*100,x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_ATT$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="Facilitates the functional incorporation\nof the urease nickel metallocenter\n(EggNOG best OG description, % of coverage)", x=expression(delta^60 * Ni ~ "(‰)"), shape= "Mertz Glacier") +
+  theme(text = element_text(size = 16))
+g4
+
+```
+
+# PFAM annotation level
+```{r PFAM}
+PFAM_IDs=unique(AnnotFull$PFAMs)[!is.na(unique(AnnotFull$PFAMs))]
+
+#Initiate matrix :
+PFAM_matrix_FL=GeneMat_Nickel_FL[,1:length(PFAM_IDs)]
+#Fill matrix
+for (i in c(1:length(PFAM_IDs))) {
+  PFAM_matrix_FL[,i]=rowSums(GeneMat_Nickel_FL[,which(names(GeneMat_Nickel_FL) %in% AnnotFull[which(AnnotFull$PFAMs==PFAM_IDs[i]),"Gene_ID"]),drop=F])
+  names(PFAM_matrix_FL)[i]=PFAM_IDs[i]
+}
+PFAM_matrix_FL=PFAM_matrix_FL[,-which(colSums(PFAM_matrix_FL)==0)]
+#
+
+#Initiate matrix :
+PFAM_matrix_ATT=GeneMat_Nickel_ATT[,1:length(PFAM_IDs)]
+#Fill matrix
+for (i in c(1:length(PFAM_IDs))) {
+  PFAM_matrix_ATT[,i]=rowSums(GeneMat_Nickel_ATT[,which(names(GeneMat_Nickel_ATT) %in% AnnotFull[which(AnnotFull$PFAMs==PFAM_IDs[i]),"Gene_ID"]), drop=F])
+  names(PFAM_matrix_ATT)[i]=PFAM_IDs[i]
+}
+PFAM_matrix_ATT=PFAM_matrix_ATT[,-which(colSums(PFAM_matrix_ATT)==0)]
+
+# FL size fraction
+
+Results_lm_FL=data.frame(PFAM_ID=c("PFAM_ID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+PFAM_matrix_FL=PFAM_matrix_FL[match(meta_nickel_FL$ACE_seq_name,row.names(PFAM_matrix_FL)),]
+
+for (i in c(1:ncol(PFAM_matrix_FL))) {
+  res=lm(PFAM_matrix_FL[,i]~meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(PFAM_matrix_FL)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(PFAM_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(PFAM_matrix_FL[,i],meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_FL[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_FL$PFAM_ID=as.factor(Results_lm_FL$PFAM_ID)
+Results_lm_FL$R2adj=as.numeric(Results_lm_FL$R2adj)
+Results_lm_FL$Coef=as.numeric(Results_lm_FL$Coef)
+Results_lm_FL$pvallm=as.numeric(Results_lm_FL$pvallm)
+Results_lm_FL$pvallm.adj=p.adjust(Results_lm_FL$pvallm, method="BH")
+Results_lm_FL$corspear=as.numeric(Results_lm_FL$corspear)
+Results_lm_FL$pvalspear=as.numeric(Results_lm_FL$pvalspear)
+Results_lm_FL$pvalspear.adj=p.adjust(Results_lm_FL$pvalspear, method="BH")
+summary(Results_lm_FL)
+# Some spearman might be worth investigating
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05),] %>% arrange(desc(corspear)) #A few significant according to spearman pre-correction
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05 & Results_lm_FL$corspear>0),] %>% arrange(desc(corspear)) # Only 2 have coeff >0 and none passes the adjustment
+
+ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_FL[,"Sod_Ni"]*100,x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=PFAM_matrix_FL[,"Sod_Ni"]*100,x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_FL$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="Sod_Ni", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+# Seems nice, maybe significant without Mertz
+
+ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_FL[,"HMA,PB1,Sod_Cu,TPR_1,XPG_I_2"]*100,x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=PFAM_matrix_FL[,"HMA,PB1,Sod_Cu,TPR_1,XPG_I_2"]*100,x=meta_nickel_FL$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_FL$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="HMA,PB1,Sod_Cu,TPR_1,XPG_I_2", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+# Not particularly high in station 8/11
+
+# Again, mertz seems to disturb the relationship. Let's try without it :
+Results_lm_FL=data.frame(PFAM_ID=c("PFAM_ID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+PFAM_matrix_FL_nomertz=PFAM_matrix_FL[match(meta_nickel_FL_nomertz$ACE_seq_name,row.names(PFAM_matrix_FL)),]
+
+for (i in c(1:ncol(PFAM_matrix_FL_nomertz))) {
+  res=lm(PFAM_matrix_FL_nomertz[,i]~meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(PFAM_matrix_FL_nomertz)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(PFAM_matrix_FL_nomertz[,i],meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(PFAM_matrix_FL_nomertz[,i],meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_FL[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_FL$PFAM_ID=as.factor(Results_lm_FL$PFAM_ID)
+Results_lm_FL$R2adj=as.numeric(Results_lm_FL$R2adj)
+Results_lm_FL$Coef=as.numeric(Results_lm_FL$Coef)
+Results_lm_FL$pvallm=as.numeric(Results_lm_FL$pvallm)
+Results_lm_FL$pvallm.adj=p.adjust(Results_lm_FL$pvallm, method="BH")
+Results_lm_FL$corspear=as.numeric(Results_lm_FL$corspear)
+Results_lm_FL$pvalspear=as.numeric(Results_lm_FL$pvalspear)
+Results_lm_FL$pvalspear.adj=p.adjust(Results_lm_FL$pvalspear, method="BH")
+summary(Results_lm_FL)
+# Some spearman might be worth investigating
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05),] %>% arrange(desc(corspear)) #14 significant according to spearman pre-correction, highest coeff = LysE,UDG and SOD_Ni
+Results_lm_FL[which(Results_lm_FL$pvalspear<0.05 & Results_lm_FL$corspear>0),] %>% arrange(desc(corspear)) # 7 have coeff >0 and 3 passes the adjustment
+
+ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_FL_nomertz[,"Sod_Ni"]*100,x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=PFAM_matrix_FL_nomertz[,"Sod_Ni"]*100,x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE), size=3) +
+  theme_bw() +
+  labs(y="Sod_Ni", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_FL_nomertz[,"LysE,UDG"]*100,x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=PFAM_matrix_FL_nomertz[,"LysE,UDG"]*100,x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE), size=3) +
+  theme_bw() +
+  labs(y="LysE,UDG", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+# ATT size fraction
+
+Results_lm_ATT=data.frame(PFAM_ID=c("PFAM_ID"),R2adj=c(0.0),Coef=c(0.0), pvallm=c(0.0), corspear=c(0.0),pvalspear=c(0.0))
+
+# We need to match orders of row names before computing any stats :
+PFAM_matrix_ATT=PFAM_matrix_ATT[match(meta_nickel_ATT$ACE_seq_name,row.names(PFAM_matrix_ATT)),]
+
+for (i in c(1:ncol(PFAM_matrix_ATT))) {
+  res=lm(PFAM_matrix_ATT[,i]~meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE)
+  agc_id=names(PFAM_matrix_ATT)[i]
+  R2=summary(res)$adj.r.squared
+  pvallm=lmp(res)
+  slope=res$coefficients[2]
+  corspear=cor(PFAM_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "spearman")
+  pvalspear=perm_test(PFAM_matrix_ATT[,i],meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE,method = "Spearman", alternative = "two.sided")$p.value
+  Results_lm_ATT[i,]=c(agc_id,R2,slope,pvallm,corspear,pvalspear)
+}
+Results_lm_ATT$PFAM_ID=as.factor(Results_lm_ATT$PFAM_ID)
+Results_lm_ATT$R2adj=as.numeric(Results_lm_ATT$R2adj)
+Results_lm_ATT$Coef=as.numeric(Results_lm_ATT$Coef)
+Results_lm_ATT$pvallm=as.numeric(Results_lm_ATT$pvallm)
+Results_lm_ATT$pvallm.adj=p.adjust(Results_lm_ATT$pvallm, method="BH")
+Results_lm_ATT$corspear=as.numeric(Results_lm_ATT$corspear)
+Results_lm_ATT$pvalspear=as.numeric(Results_lm_ATT$pvalspear)
+Results_lm_ATT$pvalspear.adj=p.adjust(Results_lm_ATT$pvalspear, method="BH")
+summary(Results_lm_ATT)
+# Some spearman might be worth investigating
+Results_lm_ATT[which(Results_lm_ATT$pvalspear<0.05),] %>% arrange(desc(corspear)) #A few significant according to spearman pre-correction
+Results_lm_ATT[which(Results_lm_ATT$pvalspear<0.05 & Results_lm_ATT$corspear>0),] %>% arrange(desc(corspear)) # Only 1 have coeff >0 and none passes the adjustment
+
+ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_ATT[,"UreD,UreF"]*100,x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2) +
+  geom_point(aes(y=PFAM_matrix_ATT[,"UreD,UreF"]*100,x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_ATT$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="UreD,UreF", x=expression(delta^60 * Ni ~ "(‰)")) +
+  theme(text = element_text(size = 16))
+
+# The most interesting can go into figures :
+
+g5 <- ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_FL_nomertz[,"Sod_Ni"]*100,x=meta_nickel_FL_nomertz$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2, col="grey20") +
+  geom_point(aes(y=PFAM_matrix_FL[,"Sod_Ni"]*100,x=meta_nickel_FL[, "Ni_60_58_D_DELTA_BOTTLE"], shape=meta_nickel_FL[, "MertzGlacier"], col=meta_nickel_FL[, "MertzGlacier"]), size=3) +
+  scale_color_manual(values=c("black","skyblue")) +
+  theme_bw() +
+  labs(y="Sod_Ni\n(PFAM annotation, % of coverage)", x=expression(delta^60 * Ni ~ "(‰)"), shape= "Mertz Glacier", col="Mertz Glacier") +
+  theme(text = element_text(size = 16))
+g5
+
+g6 <- ggplot() + 
+  geom_smooth(aes(y=PFAM_matrix_ATT[,"UreD,UreF"]*100,x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE),method="lm",alpha=0.2, col="grey20") +
+  geom_point(aes(y=PFAM_matrix_ATT[,"UreD,UreF"]*100,x=meta_nickel_ATT$Ni_60_58_D_DELTA_BOTTLE, shape=meta_nickel_ATT$MertzGlacier), size=3) +
+  theme_bw() +
+  labs(y="UreD,UreF\n(PFAM annotation, % of coverage)", x=expression(delta^60 * Ni ~ "(‰)"), shape= "Mertz Glacier") +
+  theme(text = element_text(size = 16))
+g6
+
+```
+
+# AGNOSTOS cluster level
+```{r AGNOSTOS level}
+# Load AGC abundances
+GeneMat = read.table("/Users/emifaure/Documents/ACE/NolwennCollab/Post_Review/GM_AGN_TMAX60GQ_transposed_Metallo-without-nickelgenes_rCLR-transformed.tsv", sep="\t")
+
+# If using AGC table non rCLR transformed :
+#AGCList_withtoutgeneralist=read.table("/Users/emifaure/Documents/ACE/NolwennCollab/AGC_Metallo_WithoutNickelGenes.tsv", sep="\t", header=F)
+#GeneMat=GeneMat[,which(names(GeneMat) %in% AGCList_withtoutgeneralist$V1)]
+
+GeneMat_Nickel = GeneMat[row.names(GeneMat) %in% meta_nickel$ACE_seq_name,]
+
+GeneMat_Nickel_FL = GeneMat[row.names(GeneMat) %in% meta_nickel_FL$ACE_seq_name,]
+GeneMat_Nickel_FL=GeneMat_Nickel_FL[match(meta_nickel_FL$ACE_seq_name,row.names(GeneMat_Nickel_FL)),]
+#Remove columns of only 0
+GeneMat_Nickel_FL = GeneMat_Nickel_FL[,-which(colSums(GeneMat_Nickel_FL)==0)]
+
+GeneMat_Nickel_ATT = GeneMat[row.names(GeneMat) %in% meta_nickel_ATT$ACE_seq_name,]
+GeneMat_Nickel_ATT=GeneMat_Nickel_ATT[match(meta_nickel_ATT$ACE_seq_name,row.names(GeneMat_Nickel_ATT)),]
+#Remove columns of only 0
+GeneMat_Nickel_ATT = GeneMat_Nickel_ATT[,-which(colSums(GeneMat_Nickel_ATT)==0)]
+
+# We want to associate taxonomy to each AGC, load nickel-related contigs taxo :
+Taxopos=read.table('/Users/emifaure/Documents/ACE/NolwennCollab/Post_Review/Taxonomy_Uniref90_Contigs_metallo_WithoutNickelGenes_WithKrakenLineage.tsv', sep="\t", header=F,fill=T, quote = '', na.strings="")
+# Information in column 6 is redundant with column 5
+Taxopos=Taxopos[,-6]
+names(Taxopos)=c("Contig","Seed","HighestRank","HighestAnnot_uniref","Annot_uniref","Annot_gtdb")
+
+Taxopos=separate_wider_delim(Taxopos, cols = Annot_uniref, delim = ";", names = c("Species_uniref","Genus_uniref","Family_uniref","Order_uniref",
+                                                                           "Class_uniref","Phylum_uniref","Domain_uniref","Root_uniref"))
+Taxopos=separate_wider_delim(Taxopos, cols = Annot_gtdb, delim = ";", names = c("Root_gtdb","Domain_gtdb","Phylum_gtdb","Class_gtdb","Order_gtdb","Family_gtdb","Genus_gtdb","Species_gtdb"), too_few = c("align_start"))
+
+# Needs cleaning
+Taxopos=select(Taxopos, -c("Seed","Root_gtdb","Root_uniref"))
+
+Genes=AnnotFull
+Genes$Contigs_ID=sub("_[^_]+$", "", Genes$Gene_ID)
+Genes$Contigs_ID=gsub("ACE_", "", Genes$Contigs_ID)
+
+Genes_Taxo_Annot=merge(Genes,Taxopos,by.x="Contigs_ID", by.y="Contig")
+Genes_Taxo_Annot <- Genes_Taxo_Annot %>% replace_with_na_all(condition = ~.x == "")
+Genes_Taxo_Annot <- Genes_Taxo_Annot %>% mutate_if(is.character,as.factor)
+Genes_Taxo_Annot<-as.data.frame(Genes_Taxo_Annot)
+summary(Genes_Taxo_Annot)
+
+# Finally, switch to AGC level (which will oversimplify but for visuals it's the only option)
+AGC_Taxo_Annot = Genes_Taxo_Annot %>% select(c(AGC_ID,"Species_uniref","Genus_uniref","Family_uniref","Order_uniref",
+                                               "Class_uniref","Phylum_uniref","Domain_uniref","Domain_gtdb","Phylum_gtdb",
+                                               "Class_gtdb","Order_gtdb","Family_gtdb","Genus_gtdb","Species_gtdb"))
+Mode <- function(x) {
+  ux <- na.omit(unique(x))
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+AGC_Taxo_Annot = AGC_Taxo_Annot %>% 
+  group_by(AGC_ID) %>%
+  summarise_all(Mode)
+
+summary(AGC_Taxo_Annot)
+
+# Add functional information, pre-defined as the mode of all annotations within the AGC (not taking only into account nickel-related genes/contigs)
+AGC_function <- fread("/Users/emifaure/Documents/ACE/NolwennCollab/Post_Review/Annotations_AGC_Metallo_AGCLevel.tsv", data.table=F)
+names(AGC_function)=c("AGC_ID","AGC_Rep","AGC_Size","AGC_Cat","Singl_Cat","KEGG","seed_ortholog","eggNOG_OGs","narr_OG_name","narr_OG_cat","narr_OG_desc","best_OG_name","best_OG_cat","best_OG_desc","Preferred_name","CAZy","BiGG_Reaction","PFAMs")
+AGC_Taxo_Annot <- merge(AGC_function, AGC_Taxo_Annot, by="AGC_ID")
+
+AGC_Taxo_Annot<-as.data.frame(AGC_Taxo_Annot)
+
+```
+## RDA small fraction
+```{r RDA small}
+# Multivariate analysis
+#. I- FL
+
+# We'll try to compute an RDA to determine how much of cluster abundance is driven by Nickel
+meta_nickel_FL_rda = select(meta_nickel_FL,c("ACE_seq_name","Ni_60_58_D_DELTA_BOTTLE","Ni_D_CONC_BOTTLE"))
+row.names(meta_nickel_FL_rda)=meta_nickel_FL_rda$ACE_seq_name
+meta_nickel_FL_rda=select(meta_nickel_FL_rda,-c("ACE_seq_name"))
+meta_nickel_FL_rda=data.frame(scale(meta_nickel_FL_rda))
+
+# Get rid of the AGC present in only 1 sample
+GeneMat_Nickel_FL <- GeneMat_Nickel_FL[,-which(colSums(GeneMat_Nickel_FL>0)<2)]
+
+# IF USING non transformed data, need to transform the abundances to deal with compositionality
+#GeneMat_Nickel_FL <- decostand(GeneMat_Nickel_FL, method="rclr")
+
+# Match the row order
+GeneMat_Nickel_FL_rda=GeneMat_Nickel_FL[match(row.names(meta_nickel_FL_rda),row.names(GeneMat_Nickel_FL)),]
+
+RDA=rda(GeneMat_Nickel_FL_rda ~ ., data = meta_nickel_FL_rda)
+#summary(RDA)
+RsquareAdj(RDA) #16.9%
+anova.cca(RDA) #Significant
+anova.cca(RDA, by="axis") # Both significant
+
+scores=scoresRDA(RDA)
+
+samples = scores$Sites
+samples = as.data.frame(samples)
+samples = merge(samples,meta_nickel_FL, by.x="row.names", by.y="ACE_seq_name")
+row.names(samples)=samples[,1]
+samples=samples[,-1]
+
+# Retrieve AGC scores
+AGCScore <- scores$Species
+AGCScore = as.data.frame(AGCScore)
+# Keep only scores away from center
+AGCScore_select = AGCScore[which(AGCScore$RDA1>0.75 | AGCScore$RDA1<(-0.75) | AGCScore$RDA2>0.75 | AGCScore$RDA2<(-0.75)),]
+
+enviscore=scores$Biplot
+
+#Plot the triplot
+ggplot() +   geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  labs(x = paste0("RDA1 (",
+                  round(100 * scores$Eigenval.rel[1], 1), "%)"),
+       y = paste0("RDA2 (",
+                  round(100 * scores$Eigenval.rel[2], 1), "%)")) +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_segment(data=as.data.frame(AGCScore),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.5,color = 'indianred2',arrow = arrow(length = unit(0.2,"cm")), alpha=0.25) +
+  geom_point(aes(samples[,1], samples[,2], col=samples$Ni_60_58_D_DELTA_BOTTLE), size = 5, alpha = 0.9) +
+  geom_text(aes(samples[,1], samples[,2], label=samples$TM_station_number), col="white", size=3) +
+  geom_segment(data=as.data.frame(enviscore),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.5, linetype="F1",color = 'orange',arrow = arrow(length = unit(0.2,"cm"))) +
+  geom_text(aes(enviscore[,1]*1.05, enviscore[,2]*1.05, label=rownames(enviscore)), color="orange") +
+  geom_text(aes(AGCScore_select[,1]*1.05, AGCScore_select[,2]*1.05, label=rownames(AGCScore_select)), color="indianred2") +
+  labs(col = expression(delta^60 * Ni ~ "(‰)")) +
+  geom_segment(data=as.data.frame(AGCScore_select),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.5,color = 'indianred2',arrow = arrow(length = unit(0.2,"cm"))) +
+  theme_bw() 
+
+# A pack of AGC is associated to station 11
+MertzAGC <- AGCScore[which(AGCScore$RDA1>0.5 & AGCScore$RDA2>(-0.5) & AGCScore$RDA2<(0)),]
+MertzAGC <- MertzAGC[order(MertzAGC$RDA2, decreasing = F),]
+MertzAGCannot <- AGC_Taxo_Annot[which(AGC_Taxo_Annot$AGC_ID %in% row.names(MertzAGC)),]
+MertzAGCannot <- MertzAGCannot[match(row.names(MertzAGC), MertzAGCannot$AGC_ID),]
+MertzAGCannot
+MertzGenes <- Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID %in% row.names(MertzAGC)),]
+#MertzGenes
+
+# Check the taxo within those that are dominated by unknown
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_20916161"),]
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_1069464"),]
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_14931481"),]
+
+# 3 others are correlated to dNi yet in between station 11 and 8
+DNiAGC <- AGCScore[which(AGCScore$RDA1>0.5 & AGCScore$RDA2<(-0.5)),]
+DNiAGC <- DNiAGC[order(DNiAGC$RDA1, decreasing = T),]
+DNiAGCannot <- AGC_Taxo_Annot[which(AGC_Taxo_Annot$AGC_ID %in% row.names(DNiAGC)),]
+DNiAGCannot[match(row.names(DNiAGC), DNiAGCannot$AGC_ID),]
+DNiAGCannot
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_14687886"),]
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_14548656"),]
+
+# 24 are associated to station 8
+ST8AGC <- AGCScore[which((AGCScore$RDA1<(0.5) & AGCScore$RDA1>(0) & AGCScore$RDA2<(-0.5)) | (AGCScore$RDA1<(0) & AGCScore$RDA1>(-0.5) & AGCScore$RDA2<(-0.75))),]
+ST8AGC <- ST8AGC[order(ST8AGC$RDA1, decreasing = T),]
+ST8AGCannot <- AGC_Taxo_Annot[which(AGC_Taxo_Annot$AGC_ID %in% row.names(ST8AGC)),]
+ST8AGCannot <- ST8AGCannot[match(row.names(ST8AGC), ST8AGCannot$AGC_ID),]
+ST8AGCannot
+
+ggplot() +   geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  labs(x = paste0("RDA1 (",
+                  round(100 * scores$Eigenval.rel[1], 1), "%)"),
+       y = paste0("RDA2 (",
+                  round(100 * scores$Eigenval.rel[2], 1), "%)")) +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_segment(data=as.data.frame(AGCScore),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.5,color = 'indianred2',arrow = arrow(length = unit(0.2,"cm")), alpha=0.25) +
+  geom_point(aes(samples[,1], samples[,2], col=samples$Ni_60_58_D_DELTA_BOTTLE), size = 5, alpha = 0.9) +
+  geom_text(aes(samples[,1], samples[,2], label=samples$TM_station_number), col="white", size=3) +
+  geom_segment(data=as.data.frame(enviscore),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.8, linetype="F1",color = 'forestgreen',arrow = arrow(length = unit(0.2,"cm"))) +
+  geom_text(aes(enviscore[,1]*1.05, enviscore[,2]*1.05, label=rownames(enviscore)), color="forestgreen") +
+  geom_text(aes(ST8AGC[,1]*1.05, ST8AGC[,2]*1.05, label=rownames(ST8AGC)), color="orange2") +
+  geom_segment(data=as.data.frame(ST8AGC),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.5,color = 'orange2',arrow = arrow(length = unit(0.2,"cm")), alpha=0.8) +
+  geom_text(aes(DNiAGC[,1]*1.05, DNiAGC[,2]*1.05, label=rownames(DNiAGC)), color="gold") +
+  geom_segment(data=as.data.frame(DNiAGC),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.5,color = 'gold',arrow = arrow(length = unit(0.2,"cm")), alpha=0.8) +
+  geom_text(aes(MertzAGC[,1]*1.05, MertzAGC[,2]*1.05, label=rownames(MertzAGC)), color="brown") +
+  geom_segment(data=as.data.frame(MertzAGC),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.5,color = 'brown',arrow = arrow(length = unit(0.2,"cm")), alpha=0.8) +
+  labs(col = expression(delta^60 * Ni ~ "(‰)")) +
+  theme_bw()
+```
+
+## RDA large fraction
+```{r RDA large}
+#. II - Attached
+
+meta_nickel_ATT_rda = select(meta_nickel_ATT,c("ACE_seq_name","Ni_60_58_D_DELTA_BOTTLE","Ni_D_CONC_BOTTLE"))
+row.names(meta_nickel_ATT_rda)=meta_nickel_ATT_rda$ACE_seq_name
+meta_nickel_ATT_rda=select(meta_nickel_ATT_rda,-c("ACE_seq_name"))
+meta_nickel_ATT_rda=data.frame(scale(meta_nickel_ATT_rda))
+
+# Get rid of the AGC present in only 1 sample
+GeneMat_Nickel_ATT <- GeneMat_Nickel_ATT[,-which(colSums(GeneMat_Nickel_ATT>0)<2)]
+
+# IF USING non transformed data, need to transform the abundances to deal with compositionality
+#GeneMat_Nickel_ATT <- decostand(GeneMat_Nickel_ATT, method="rclr")
+
+#Match row names
+GeneMat_Nickel_ATT_rda=GeneMat_Nickel_ATT[match(row.names(meta_nickel_ATT_rda),row.names(GeneMat_Nickel_ATT)),]
+
+RDA=rda(GeneMat_Nickel_ATT_rda ~ ., data = meta_nickel_ATT_rda)
+#summary(RDA)
+RsquareAdj(RDA) #28.7%
+anova.cca(RDA) #Significant
+anova.cca(RDA, by="axis") 
+
+scores=scoresRDA(RDA)
+
+samples = scores$Sites
+samples = as.data.frame(samples)
+samples = merge(samples,meta_nickel_ATT, by.x="row.names", by.y="ACE_seq_name")
+row.names(samples)=samples[,1]
+samples=samples[,-1]
+
+# Retrieve AGC scores
+AGCScore <- scores$Species
+AGCScore = as.data.frame(AGCScore)
+# Keep only scores away from center
+AGCScore_select = AGCScore[which(AGCScore$RDA1>0.5 | AGCScore$RDA1<(-0.5) | AGCScore$RDA2>0.5 | AGCScore$RDA2<(-0.5)),]
+
+enviscore=scores$Biplot
+
+#Plot the triplot
+ggplot() +   geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  labs(x = paste0("RDA1 (",
+                  round(100 * scores$Eigenval.rel[1], 1), "%)"),
+       y = paste0("RDA2 (",
+                  round(100 * scores$Eigenval.rel[2], 1), "%)")) +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_segment(data=as.data.frame(AGCScore),aes(xend = RDA1, yend = RDA2),x=0,y=0,size = 0.5,color = 'indianred2',arrow = arrow(length = unit(0.2,"cm")), alpha=0.25) +
+  geom_point(aes(samples[,1], samples[,2], col=samples$Ni_60_58_D_DELTA_BOTTLE), size = 5, alpha = 0.9) +
+  geom_text(aes(samples[,1], samples[,2], label=samples$TM_station_number), col="white", size=3) +
+  geom_segment(data=as.data.frame(enviscore),aes(xend = RDA1, yend = RDA2),x=0,y=0,size = 0.5, linetype="F1",color = 'orange',arrow = arrow(length = unit(0.2,"cm"))) +
+  geom_text(aes(enviscore[,1]*1.05, enviscore[,2]*1.05, label=rownames(enviscore)), color="orange") +
+  geom_text(aes(AGCScore_select[,1]*1.05, AGCScore_select[,2]*1.05, label=rownames(AGCScore_select)), color="indianred2") +
+  labs(col = "DeltaNickel60-58") +
+  geom_segment(data=as.data.frame(AGCScore_select),aes(xend = RDA1, yend = RDA2),x=0,y=0,size = 0.5,color = 'indianred2',arrow = arrow(length = unit(0.2,"cm"))) +
+  theme_bw() 
+
+# A pack of AGC is associated to station 11
+MertzAGC <- AGCScore[which(AGCScore$RDA1>0.25 & AGCScore$RDA2<(-0.5)),]
+MertzAGC <- MertzAGC[order(MertzAGC$RDA2, decreasing = F),]
+MertzAGCannot <- AGC_Taxo_Annot[which(AGC_Taxo_Annot$AGC_ID %in% row.names(MertzAGC)),]
+MertzAGCannot <- MertzAGCannot[match(row.names(MertzAGC), MertzAGCannot$AGC_ID),]
+
+MertzGenes <- Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID %in% row.names(MertzAGC)),]
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_1819471"),]
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_2646602"),]
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_2848081"),]
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_22886549"),]
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_5722614"),]
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_23334844"),]
+#summary(Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_2848081"),])
+
+# One is correlated to dNi yet in between station 11 and 8
+DNiAGC <- AGCScore[which(AGCScore$RDA1<0.25 & AGCScore$RDA1>(-0.25) & AGCScore$RDA2<(-0.75)),]
+DNiAGCannot <- AGC_Taxo_Annot[which(AGC_Taxo_Annot$AGC_ID %in% row.names(DNiAGC)),]
+#Genes_Taxo_Annot[which(Genes_Taxo_Annot$AGC_ID=="AGC_24852953"),]
+
+# 19 are associated to station 8
+ST8AGC <- AGCScore[which(AGCScore$RDA1<(-0.25) & AGCScore$RDA2<(-0.5)),]
+ST8AGC <- ST8AGC[order(ST8AGC$RDA2, decreasing = F),]
+ST8AGCannot <- AGC_Taxo_Annot[which(AGC_Taxo_Annot$AGC_ID %in% row.names(ST8AGC)),]
+ST8AGCannot <- ST8AGCannot[match(row.names(ST8AGC), ST8AGCannot$AGC_ID),]
+
+ggplot() +   geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  labs(x = paste0("RDA1 (",
+                  round(100 * scores$Eigenval.rel[1], 1), "%)"),
+       y = paste0("RDA2 (",
+                  round(100 * scores$Eigenval.rel[2], 1), "%)")) +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_segment(data=as.data.frame(AGCScore),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.5,color = 'indianred2',arrow = arrow(length = unit(0.2,"cm")), alpha=0.25) +
+  geom_point(aes(samples[,1], samples[,2], col=samples$Ni_60_58_D_DELTA_BOTTLE), size = 5, alpha = 0.9) +
+  geom_text(aes(samples[,1], samples[,2], label=samples$TM_station_number), col="white", size=3) +
+  geom_segment(data=as.data.frame(enviscore),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.8, linetype="F1",color = 'forestgreen',arrow = arrow(length = unit(0.2,"cm"))) +
+  geom_text(aes(enviscore[,1]*1.05, enviscore[,2]*1.05, label=rownames(enviscore)), color="forestgreen") +
+  geom_text(aes(ST8AGC[,1]*1.05, ST8AGC[,2]*1.05, label=rownames(ST8AGC)), color="orange2") +
+  geom_segment(data=as.data.frame(ST8AGC),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.5,color = 'orange2',arrow = arrow(length = unit(0.2,"cm"))) +
+  geom_text(aes(DNiAGC[,1]*1.05, DNiAGC[,2]*1.05, label=rownames(DNiAGC)), color="gold") +
+  geom_segment(data=as.data.frame(DNiAGC),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.5,color = 'gold',arrow = arrow(length = unit(0.2,"cm"))) +
+  geom_text(aes(MertzAGC[,1]*1.05, MertzAGC[,2]*1.05, label=rownames(MertzAGC)), color="brown") +
+  geom_segment(data=as.data.frame(MertzAGC),aes(xend = RDA1, yend = RDA2),x=0,y=0,linewidth = 0.5,color = 'brown',arrow = arrow(length = unit(0.2,"cm"))) +
+  labs(col = expression(delta^60 * Ni ~ "(‰)")) +
+  theme_bw() 
+
+```
+
